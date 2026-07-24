@@ -877,13 +877,22 @@ def _append_llama_cpp_linux_accel_build_lines(runner_lines: list[str]) -> None:
     # Accept any of unzip / bsdtar / python3 -m zipfile as the extractor.
     # python3 is essentially always present on modern Linux, so this lets
     # the prebuilt path work on minimal Ubuntu installs that lack `unzip`.
+    # NOTE: the asset isn't always actually a zip - llama.cpp's ubuntu-vulkan
+    # (and some other) release assets ship as .tar.gz despite matching the
+    # same "ubuntu.*vulkan" name pattern used to pick the URL. Detect the
+    # real format from the gzip magic bytes (1f 8b) rather than trusting the
+    # saved filename, since zipfile/unzip/bsdtar-as-zip all fail hard on a
+    # gzip stream (upstream odysseus-dev/odysseus#5636).
     runner_lines.append('    if [ -n "$_odysseus_prebuilt_url" ] && (command -v unzip >/dev/null 2>&1 || command -v bsdtar >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1); then')
     runner_lines.append('      echo "[odysseus] Found prebuilt llama-server: $_odysseus_prebuilt_url"')
     runner_lines.append('      mkdir -p ~/bin "$HOME/.cache/odysseus/llama-cpp-prebuilt" && cd "$HOME/.cache/odysseus/llama-cpp-prebuilt"')
     runner_lines.append('      rm -f llama-cpp.zip')
     runner_lines.append('      if curl -fsSL --max-time 120 "$_odysseus_prebuilt_url" -o llama-cpp.zip && [ -s llama-cpp.zip ]; then')
     runner_lines.append('        rm -rf build && mkdir -p build')
-    runner_lines.append('        if command -v unzip >/dev/null 2>&1; then unzip -qq -o llama-cpp.zip -d build; elif command -v bsdtar >/dev/null 2>&1; then bsdtar -xf llama-cpp.zip -C build; else python3 -c "import zipfile; zipfile.ZipFile(\\"llama-cpp.zip\\").extractall(\\"build\\")"; fi')
+    runner_lines.append('        _odysseus_magic="$(head -c2 llama-cpp.zip | od -An -tx1 | tr -d " \\n")"')
+    runner_lines.append('        if [ "$_odysseus_magic" = "1f8b" ]; then')
+    runner_lines.append('          tar -xzf llama-cpp.zip -C build')
+    runner_lines.append('        elif command -v unzip >/dev/null 2>&1; then unzip -qq -o llama-cpp.zip -d build; elif command -v bsdtar >/dev/null 2>&1; then bsdtar -xf llama-cpp.zip -C build; else python3 -c "import zipfile; zipfile.ZipFile(\\"llama-cpp.zip\\").extractall(\\"build\\")"; fi')
     runner_lines.append('        _odysseus_extracted="$(find build -type f -name llama-server 2>/dev/null | head -1)"')
     runner_lines.append('        if [ -n "$_odysseus_extracted" ]; then')
     runner_lines.append('          chmod +x "$_odysseus_extracted"')

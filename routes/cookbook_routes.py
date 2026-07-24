@@ -2149,7 +2149,14 @@ def setup_cookbook_routes() -> APIRouter:
                 # Include the Homebrew bin dirs so a brew-installed llama-server /
                 # ollama is found (otherwise macOS falls back to a slow source build).
                 # /opt/homebrew = Apple Silicon, /usr/local = Intel; harmless on Linux.
-                runner_lines.append('export PATH="$HOME/.local/bin:$HOME/bin:$HOME/llama.cpp/build/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"')
+                # $HOME/bin (native binary symlink target) MUST precede
+                # $HOME/.local/bin (pip console-script dir) here: a stale
+                # llama-cpp-python[server] shim left over in .local/bin from an
+                # earlier fallback install otherwise shadows the native build
+                # this block goes on to prefer, and can make the `command -v
+                # llama-server` gate below succeed against the wrong binary,
+                # silently skipping the native build entirely.
+                runner_lines.append('export PATH="$HOME/bin:$HOME/.local/bin:$HOME/llama.cpp/build/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"')
                 runner_lines.append('if [ -d /data/data/com.termux ]; then')
                 runner_lines.append('  # Termux: no native build — use the Python bindings (CPU).')
                 runner_lines.append('  if ! python3 -c "import llama_cpp" 2>/dev/null; then')
