@@ -94,8 +94,15 @@ def _get_or_404_calendar(db, cal_id: str, owner: str) -> CalendarCal:
     return cal
 
 
-def _get_or_404_event(db, uid: str, owner: str) -> CalendarEvent:
-    ev = db.query(CalendarEvent).join(CalendarCal).filter(CalendarEvent.uid == uid).first()
+def _get_or_404_event(db, uid: str, owner: str, calendar_id: str | None = None) -> CalendarEvent:
+    q = db.query(CalendarEvent).join(CalendarCal).filter(CalendarEvent.uid == uid)
+    # calendar_id disambiguates a uid shared across more than one calendar
+    # (e.g. the same Google Calendar event synced via several family
+    # members' Workspace accounts). Without it this arbitrarily picks
+    # whichever matching row comes back first.
+    if calendar_id:
+        q = q.filter(CalendarEvent.calendar_id == calendar_id)
+    ev = q.first()
     if not ev:
         raise HTTPException(404, "Event not found")
     cal = ev.calendar
@@ -148,20 +155,20 @@ def _resolve_base_uid(uid: str) -> str:
     return base
 
 
-async def _push_caldav_event_after_commit(owner: str, uid: str, action: str):
+async def _push_caldav_event_after_commit(owner: str, uid: str, action: str, calendar_id: str | None = None):
     """Best-effort CalDAV write-through. Local writes stay authoritative if
     the remote server is unreachable; pending flags let /sync retry later."""
     try:
         result = {"ok": True}
         if action == "create":
             from src.caldav_sync import push_event_create
-            result = await push_event_create(owner, uid)
+            result = await push_event_create(owner, uid, calendar_id)
         elif action == "update":
             from src.caldav_sync import push_event_update
-            result = await push_event_update(owner, uid)
+            result = await push_event_update(owner, uid, calendar_id)
         elif action == "delete":
             from src.caldav_sync import push_event_delete
-            result = await push_event_delete(owner, uid)
+            result = await push_event_delete(owner, uid, calendar_id)
         if result and not result.get("ok") and not result.get("skipped"):
             raise RuntimeError(result.get("error") or result)
     except Exception as e:
@@ -169,7 +176,7 @@ async def _push_caldav_event_after_commit(owner: str, uid: str, action: str):
         if action in {"create", "update"}:
             db = SessionLocal()
             try:
-                ev = _get_or_404_event(db, uid, owner)
+                ev = _get_or_404_event(db, uid, owner, calendar_id)
                 ev.caldav_sync_pending = action
                 db.commit()
             except Exception:
@@ -181,12 +188,16 @@ async def _push_caldav_event_after_commit(owner: str, uid: str, action: str):
 def _record_caldav_delete_tombstone(db, ev: CalendarEvent, owner: str) -> None:
     if not (ev.calendar and ev.calendar.source == "caldav"):
         return
+    # Scoped to ev.calendar_id too: without it, deleting a shared uid on one
+    # calendar would find and overwrite another calendar's existing
+    # tombstone for the same uid instead of creating this calendar's own.
     tombstone = db.query(CalendarDeletedEvent).filter(
         CalendarDeletedEvent.uid == ev.uid,
         CalendarDeletedEvent.owner == owner,
+        CalendarDeletedEvent.calendar_id == ev.calendar_id,
     ).first()
     if not tombstone:
-        tombstone = CalendarDeletedEvent(uid=ev.uid, owner=owner)
+        tombstone = CalendarDeletedEvent(uid=ev.uid, owner=owner, calendar_id=ev.calendar_id)
         db.add(tombstone)
     tombstone.calendar_id = ev.calendar_id
     tombstone.remote_href = ev.remote_href
@@ -1394,7 +1405,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             db.commit()
             db.refresh(ev)
             if cal.source == "caldav":
-                await _push_caldav_event_after_commit(owner, uid, "create")
+                await _push_caldav_event_after_commit(owner, uid, "create", cal.id)
             return {
                 "ok": True,
                 "uid": uid,
@@ -1422,7 +1433,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             db.close()
 
     @router.put("/events/{uid}")
-    async def update_event(request: Request, uid: str, data: EventUpdate):
+    async def update_event(request: Request, uid: str, data: EventUpdate, calendar_id: str | None = None):
         owner = _require_user(request)
         _reserve_calendar_uploads(request, data.color, data.description, data.location)
         try:
@@ -1431,7 +1442,11 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             raise HTTPException(400, str(e))
         db = SessionLocal()
         try:
-            ev = _get_or_404_event(db, base_uid, owner)
+            # calendar_id is optional (existing callers don't send it) -
+            # only matters when the uid is shared across more than one of
+            # the owner's calendars, in which case omitting it falls back to
+            # picking whichever match comes back first.
+            ev = _get_or_404_event(db, base_uid, owner, calendar_id)
             if data.summary is not None:
                 ev.summary = data.summary
             if data.description is not None:
@@ -1469,7 +1484,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             db.commit()
             db.refresh(ev)
             if is_caldav:
-                await _push_caldav_event_after_commit(owner, base_uid, "update")
+                await _push_caldav_event_after_commit(owner, base_uid, "update", ev.calendar_id)
             return {
                 "ok": True,
                 "event": _event_to_dict(ev, db=db, owner=owner),
@@ -1485,7 +1500,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             db.close()
 
     @router.delete("/events/{uid}")
-    async def delete_event(request: Request, uid: str, scope: str = "series"):
+    async def delete_event(request: Request, uid: str, scope: str = "series", calendar_id: str | None = None):
         owner = _require_user(request)
         try:
             base_uid = _resolve_base_uid(uid)
@@ -1493,7 +1508,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             raise HTTPException(400, str(e))
         db = SessionLocal()
         try:
-            ev = _get_or_404_event(db, base_uid, owner)
+            ev = _get_or_404_event(db, base_uid, owner, calendar_id)
             is_occurrence_delete = scope in {"occurrence", "instance"} and "::" in uid and bool(ev.rrule)
             is_caldav = ev.calendar and ev.calendar.source == "caldav"
             if scope in {"occurrence", "instance"} and not is_occurrence_delete:
@@ -1510,15 +1525,16 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     ev.caldav_sync_pending = "update"
                 db.commit()
                 if is_caldav:
-                    await _push_caldav_event_after_commit(owner, base_uid, "update")
+                    await _push_caldav_event_after_commit(owner, base_uid, "update", ev.calendar_id)
                 return {"ok": True, "scope": "occurrence", "exdate": key}
             if is_caldav:
                 _record_caldav_delete_tombstone(db, ev, owner)
             _delete_calendar_reminders_for_event(db, owner, ev)
+            ev_calendar_id = ev.calendar_id
             db.delete(ev)
             db.commit()
             if is_caldav:
-                await _push_caldav_event_after_commit(owner, base_uid, "delete")
+                await _push_caldav_event_after_commit(owner, base_uid, "delete", ev_calendar_id)
             return {"ok": True}
         except HTTPException:
             raise
