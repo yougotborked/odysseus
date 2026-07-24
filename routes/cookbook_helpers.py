@@ -865,14 +865,26 @@ def _append_llama_cpp_linux_accel_build_lines(runner_lines: list[str]) -> None:
     runner_lines.append('      _odysseus_has_nv_inline() { command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q "GPU "; }')
     runner_lines.append('      _odysseus_has_vk_inline() { ldconfig -p 2>/dev/null | grep -q "libvulkan\\.so" || command -v vulkaninfo >/dev/null 2>&1 || [ -e /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ]; }')
     runner_lines.append('      _odysseus_has_vkdev_inline() { ls /dev/dri/renderD* >/dev/null 2>&1 || (lspci 2>/dev/null | grep -Ei \'VGA|3D|Display\' | grep -Eiq \'AMD|ATI|Radeon\'); }')
+    runner_lines.append('      _odysseus_has_rocm_inline() { command -v hipconfig >/dev/null 2>&1 || [ -d /opt/rocm ] || [ -n "$ROCM_PATH" ] || [ -n "$HIP_PATH" ]; }')
     runner_lines.append('      if _odysseus_has_nv_inline; then')
     runner_lines.append('        _odysseus_pat="ubuntu.*cuda"')
+    runner_lines.append('      elif _odysseus_has_rocm_inline; then')
+    # llama.cpp's GitHub releases don't publish a ROCm/HIP prebuilt (only
+    # cuda/vulkan/plain-cpu ubuntu assets exist), and the from-source build
+    # below already correctly prefers HIP > CUDA > Vulkan > CPU on AMD. So
+    # when a ROCm toolchain is present, skip the prebuilt lookup entirely
+    # (leave _odysseus_pat empty) rather than grabbing the Vulkan prebuilt -
+    # taking that ~30-40% slower path just because it downloads in 30s
+    # instead of a several-minute HIP compile.
+    runner_lines.append('        _odysseus_pat=""')
     runner_lines.append('      elif _odysseus_has_vkdev_inline && _odysseus_has_vk_inline; then')
     runner_lines.append('        _odysseus_pat="ubuntu.*vulkan"')
     runner_lines.append('      else')
     runner_lines.append('        _odysseus_pat="ubuntu-x64\\\\.zip"')
     runner_lines.append('      fi')
-    runner_lines.append('      _odysseus_prebuilt_url="$(curl -fsSL --max-time 15 https://api.github.com/repos/ggml-org/llama.cpp/releases/latest 2>/dev/null | grep \'"browser_download_url"\' | cut -d\'"\' -f4 | grep -iE "$_odysseus_pat" | grep -iv "arm\\|aarch64" | head -1)"')
+    runner_lines.append('      if [ -n "$_odysseus_pat" ]; then')
+    runner_lines.append('        _odysseus_prebuilt_url="$(curl -fsSL --max-time 15 https://api.github.com/repos/ggml-org/llama.cpp/releases/latest 2>/dev/null | grep \'"browser_download_url"\' | cut -d\'"\' -f4 | grep -iE "$_odysseus_pat" | grep -iv "arm\\|aarch64" | head -1)"')
+    runner_lines.append('      fi')
     runner_lines.append('    fi')
     # Accept any of unzip / bsdtar / python3 -m zipfile as the extractor.
     # python3 is essentially always present on modern Linux, so this lets
