@@ -1750,11 +1750,20 @@ class CalendarCal(TimestampMixin, Base):
 
 
 class CalendarEvent(TimestampMixin, Base):
-    """A calendar event."""
+    """A calendar event.
+
+    (uid, calendar_id) is a composite primary key, not uid alone. The same
+    VEVENT uid can legitimately exist on more than one synced calendar (a
+    Google Calendar event shared across several Workspace accounts each
+    synced here as their own CalDAV calendar) - a bare-uid PK made the second
+    calendar's insert fail with a UNIQUE constraint violation on every sync.
+    Edits/deletes are scoped per-calendar to match: acting on one calendar's
+    copy of a shared event does not touch the other calendars' copies.
+    """
     __tablename__ = "calendar_events"
 
     uid         = Column(String, primary_key=True, index=True)
-    calendar_id = Column(String, ForeignKey("calendars.id"), nullable=False, index=True)
+    calendar_id = Column(String, ForeignKey("calendars.id"), primary_key=True, nullable=False, index=True)
     summary     = Column(String, nullable=False, default="")
     description = Column(Text, default="")
     location    = Column(String, default="")
@@ -1784,12 +1793,17 @@ class CalendarEvent(TimestampMixin, Base):
 
 
 class CalendarDeletedEvent(TimestampMixin, Base):
-    """Hidden CalDAV delete tombstone retained until remote delete succeeds."""
+    """Hidden CalDAV delete tombstone retained until remote delete succeeds.
+
+    (uid, calendar_id) composite key, same reasoning as CalendarEvent: a
+    shared event deleted on one synced calendar must not suppress it on a
+    sibling calendar sharing the same uid.
+    """
     __tablename__ = "caldav_deleted_events"
 
     uid = Column(String, primary_key=True, index=True)
     owner = Column(String, nullable=True, index=True)
-    calendar_id = Column(String, nullable=True, index=True)
+    calendar_id = Column(String, primary_key=True, index=True)
     remote_href = Column(String, nullable=True)
     remote_etag = Column(String, nullable=True)
     caldav_base_url = Column(String, nullable=True)
@@ -1967,6 +1981,7 @@ def init_db():
     _migrate_add_calendar_account_id()
     _migrate_add_caldav_sync_columns()
     _migrate_add_calendar_recurrence_exdates()
+    _migrate_calendar_events_composite_pk()
     _migrate_chat_messages_fts()
     _migrate_encrypt_email_passwords()
     _migrate_encrypt_signatures()
@@ -2386,6 +2401,133 @@ def _migrate_add_calendar_recurrence_exdates():
         logging.getLogger(__name__).warning(f"calendar_events recurrence_exdates migration failed: {e}")
     finally:
         try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_calendar_events_composite_pk():
+    """Rescope calendar_events and caldav_deleted_events to a (uid, calendar_id)
+    composite primary key, instead of uid alone.
+
+    A shared Google Calendar event (same VEVENT uid) synced via more than one
+    CalDAV calendar - e.g. several family members' Workspace accounts each
+    added as their own calendar here - made every sync after the first one
+    fail its INSERT with "UNIQUE constraint failed: calendar_events.uid",
+    aborting that entire calendar's sync batch (not just the shared event).
+
+    SQLite can't ALTER a PRIMARY KEY in place, so this recreates both tables
+    with the new key and copies the data across. Idempotent: skipped once
+    calendar_id is already part of the PK (checked via the pk ordinal in
+    PRAGMA table_info, which is 0 for non-key columns).
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=OFF")
+
+        def _pk_ordinal(table: str, column: str) -> int:
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall():
+                # row: (cid, name, type, notnull, dflt_value, pk)
+                if row[1] == column:
+                    return row[5]
+            return 0
+
+        # --- calendar_events ---
+        ev_cols = [row[1] for row in conn.execute("PRAGMA table_info(calendar_events)").fetchall()]
+        if ev_cols and _pk_ordinal("calendar_events", "calendar_id") == 0:
+            col_list = ", ".join(ev_cols)
+            conn.execute(f"""
+                CREATE TABLE calendar_events_new (
+                    uid TEXT NOT NULL,
+                    calendar_id TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    description TEXT DEFAULT '',
+                    location TEXT DEFAULT '',
+                    dtstart DATETIME NOT NULL,
+                    dtend DATETIME NOT NULL,
+                    all_day BOOLEAN DEFAULT 0,
+                    is_utc BOOLEAN NOT NULL DEFAULT 0,
+                    rrule TEXT DEFAULT '',
+                    recurrence_exdates TEXT DEFAULT '',
+                    color TEXT,
+                    status TEXT DEFAULT 'confirmed',
+                    importance TEXT DEFAULT 'normal',
+                    event_type TEXT,
+                    last_pinged DATETIME,
+                    origin TEXT,
+                    remote_href TEXT,
+                    remote_etag TEXT,
+                    caldav_sync_pending TEXT,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME,
+                    PRIMARY KEY (uid, calendar_id),
+                    FOREIGN KEY (calendar_id) REFERENCES calendars(id)
+                )
+            """)
+            # Pre-existing duplicate (uid, calendar_id) pairs can't happen -
+            # uid alone was the old PK, so at most one row per uid existed.
+            conn.execute(f"INSERT INTO calendar_events_new ({col_list}) SELECT {col_list} FROM calendar_events")
+            conn.execute("DROP TABLE calendar_events")
+            conn.execute("ALTER TABLE calendar_events_new RENAME TO calendar_events")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_calendar_events_uid ON calendar_events(uid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_calendar_events_calendar_id ON calendar_events(calendar_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_calendar_events_dtstart ON calendar_events(dtstart)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_calendar_events_origin ON calendar_events(origin)")
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Migrated: calendar_events primary key is now (uid, calendar_id)"
+            )
+
+        # --- caldav_deleted_events ---
+        del_cols = [row[1] for row in conn.execute("PRAGMA table_info(caldav_deleted_events)").fetchall()]
+        if del_cols and _pk_ordinal("caldav_deleted_events", "calendar_id") == 0:
+            # Tombstones from before calendar_id existed have it NULL - they
+            # can't be scoped to a specific calendar, so drop them rather than
+            # invent a calendar_id. Worst case: that one pending deletion gets
+            # re-created on the next sync instead of staying hidden.
+            conn.execute("DELETE FROM caldav_deleted_events WHERE calendar_id IS NULL")
+            col_list = ", ".join(del_cols)
+            conn.execute("""
+                CREATE TABLE caldav_deleted_events_new (
+                    uid TEXT NOT NULL,
+                    owner TEXT,
+                    calendar_id TEXT NOT NULL,
+                    remote_href TEXT,
+                    remote_etag TEXT,
+                    caldav_base_url TEXT,
+                    summary TEXT,
+                    last_error TEXT,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME,
+                    PRIMARY KEY (uid, calendar_id)
+                )
+            """)
+            conn.execute(
+                f"INSERT INTO caldav_deleted_events_new ({col_list}) SELECT {col_list} FROM caldav_deleted_events"
+            )
+            conn.execute("DROP TABLE caldav_deleted_events")
+            conn.execute("ALTER TABLE caldav_deleted_events_new RENAME TO caldav_deleted_events")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_caldav_deleted_events_uid ON caldav_deleted_events(uid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_caldav_deleted_events_owner ON caldav_deleted_events(owner)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_caldav_deleted_events_calendar_id ON caldav_deleted_events(calendar_id)")
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Migrated: caldav_deleted_events primary key is now (uid, calendar_id)"
+            )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"calendar_events composite PK migration failed: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.close()
         except Exception:
             pass

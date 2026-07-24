@@ -507,17 +507,23 @@ def _event_payload(ev) -> dict:
     }
 
 
-def _load_event_for_writeback(owner: str, uid: str) -> tuple[str, str, dict] | None:
+def _load_event_for_writeback(owner: str, uid: str, calendar_id: str | None = None) -> tuple[str, str, dict] | None:
     from core.database import CalendarCal, CalendarEvent, SessionLocal
 
     db = SessionLocal()
     try:
-        ev = (
-            db.query(CalendarEvent)
-            .join(CalendarCal)
-            .filter(CalendarEvent.uid == uid, CalendarCal.owner == owner)
-            .first()
+        q = db.query(CalendarEvent).join(CalendarCal).filter(
+            CalendarEvent.uid == uid, CalendarCal.owner == owner
         )
+        # calendar_id disambiguates a uid shared across more than one of the
+        # owner's calendars. Callers that already know it (the routes, which
+        # just loaded the specific event being edited) should always pass it;
+        # the fallback to .first() only matters for legacy/internal callers
+        # that don't, and picks arbitrarily among the owner's matches like
+        # the old bare-uid lookup always did.
+        if calendar_id:
+            q = q.filter(CalendarEvent.calendar_id == calendar_id)
+        ev = q.first()
         if not ev or not ev.calendar or ev.calendar.source != "caldav":
             return None
         return ev.calendar.source, ev.calendar.id, _event_payload(ev)
@@ -525,24 +531,27 @@ def _load_event_for_writeback(owner: str, uid: str) -> tuple[str, str, dict] | N
         db.close()
 
 
-def _load_delete_for_writeback(owner: str, uid: str) -> tuple[str, str, dict] | None:
+def _load_delete_for_writeback(owner: str, uid: str, calendar_id: str | None = None) -> tuple[str, str, dict] | None:
     from core.database import CalendarCal, CalendarDeletedEvent, CalendarEvent, SessionLocal
 
     db = SessionLocal()
     try:
-        tombstone = db.query(CalendarDeletedEvent).filter(
+        tq = db.query(CalendarDeletedEvent).filter(
             CalendarDeletedEvent.uid == uid,
             CalendarDeletedEvent.owner == owner,
-        ).first()
+        )
+        if calendar_id:
+            tq = tq.filter(CalendarDeletedEvent.calendar_id == calendar_id)
+        tombstone = tq.first()
         if tombstone:
             return "caldav", tombstone.calendar_id, {"uid": uid}
 
-        ev = (
-            db.query(CalendarEvent)
-            .join(CalendarCal)
-            .filter(CalendarEvent.uid == uid, CalendarCal.owner == owner)
-            .first()
+        eq = db.query(CalendarEvent).join(CalendarCal).filter(
+            CalendarEvent.uid == uid, CalendarCal.owner == owner
         )
+        if calendar_id:
+            eq = eq.filter(CalendarEvent.calendar_id == calendar_id)
+        ev = eq.first()
         if not ev or not ev.calendar or ev.calendar.source != "caldav":
             return None
         return ev.calendar.source, ev.calendar.id, {"uid": uid}
@@ -550,13 +559,18 @@ def _load_delete_for_writeback(owner: str, uid: str) -> tuple[str, str, dict] | 
         db.close()
 
 
-def _pending_writeback_uids(owner: str) -> tuple[list[str], list[str]]:
+def _pending_writeback_uids(owner: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Return [(uid, calendar_id), ...] for pending updates and deletes.
+
+    calendar_id travels alongside uid so the push functions can target the
+    exact row instead of guessing among calendars that share a uid.
+    """
     from core.database import CalendarCal, CalendarDeletedEvent, CalendarEvent, SessionLocal
 
     db = SessionLocal()
     try:
         rows = (
-            db.query(CalendarEvent.uid)
+            db.query(CalendarEvent.uid, CalendarEvent.calendar_id)
             .join(CalendarCal)
             .filter(
                 CalendarCal.owner == owner,
@@ -570,11 +584,11 @@ def _pending_writeback_uids(owner: str) -> tuple[list[str], list[str]]:
             .all()
         )
         delete_rows = (
-            db.query(CalendarDeletedEvent.uid)
+            db.query(CalendarDeletedEvent.uid, CalendarDeletedEvent.calendar_id)
             .filter(CalendarDeletedEvent.owner == owner)
             .all()
         )
-        return [row[0] for row in rows], [row[0] for row in delete_rows]
+        return [(row[0], row[1]) for row in rows], [(row[0], row[1]) for row in delete_rows]
     finally:
         db.close()
 
@@ -656,34 +670,34 @@ async def sync_caldav(owner: str) -> dict:
     return totals
 
 
-async def push_event_create(owner: str, uid: str) -> dict:
-    loaded = _load_event_for_writeback(owner, uid)
+async def push_event_create(owner: str, uid: str, calendar_id: str | None = None) -> dict:
+    loaded = _load_event_for_writeback(owner, uid, calendar_id)
     if not loaded:
         return {"ok": True, "skipped": True}
-    source, calendar_id, payload = loaded
+    source, resolved_calendar_id, payload = loaded
     from src.caldav_writeback import writeback_event
-    return await writeback_event(owner, source, calendar_id, payload)
+    return await writeback_event(owner, source, resolved_calendar_id, payload)
 
 
-async def push_event_update(owner: str, uid: str) -> dict:
-    return await push_event_create(owner, uid)
+async def push_event_update(owner: str, uid: str, calendar_id: str | None = None) -> dict:
+    return await push_event_create(owner, uid, calendar_id)
 
 
-async def push_event_delete(owner: str, uid: str) -> dict:
-    loaded = _load_delete_for_writeback(owner, uid)
+async def push_event_delete(owner: str, uid: str, calendar_id: str | None = None) -> dict:
+    loaded = _load_delete_for_writeback(owner, uid, calendar_id)
     if not loaded:
         return {"ok": True, "skipped": True}
-    source, calendar_id, payload = loaded
+    source, resolved_calendar_id, payload = loaded
     from src.caldav_writeback import writeback_event
-    return await writeback_event(owner, source, calendar_id, payload, delete=True)
+    return await writeback_event(owner, source, resolved_calendar_id, payload, delete=True)
 
 
 async def push_pending_events(owner: str) -> dict:
     result = {"events": 0, "errors": []}
     uids, delete_uids = _pending_writeback_uids(owner)
-    for event_uid in uids:
+    for event_uid, event_calendar_id in uids:
         try:
-            out = await push_event_update(owner, event_uid)
+            out = await push_event_update(owner, event_uid, event_calendar_id)
             if out.get("ok"):
                 result["events"] += 1
             elif not out.get("skipped"):
@@ -691,9 +705,9 @@ async def push_pending_events(owner: str) -> dict:
         except Exception as e:
             logger.warning("CalDAV pending push failed for uid=%s: %s", event_uid, e)
             result["errors"].append(f"{event_uid}: {str(e)[:160]}")
-    for event_uid in delete_uids:
+    for event_uid, event_calendar_id in delete_uids:
         try:
-            out = await push_event_delete(owner, event_uid)
+            out = await push_event_delete(owner, event_uid, event_calendar_id)
             if out.get("ok"):
                 result["events"] += 1
             elif not out.get("skipped"):
