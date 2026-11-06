@@ -39,11 +39,11 @@ croutes.SessionLocal = _TS
 def calls(monkeypatch):
     recorded = []
 
-    async def _fake_create(owner, uid):
+    async def _fake_create(owner, uid, calendar_id=None):
         recorded.append({"uid": uid, "delete": False, "action": "create"})
         return {"ok": True}
 
-    async def _fake_delete(owner, uid):
+    async def _fake_delete(owner, uid, calendar_id=None):
         recorded.append({"uid": uid, "delete": True, "action": "delete"})
         return {"ok": True}
 

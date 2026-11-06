@@ -45,9 +45,9 @@ def test_http_calendar_writes_mark_pending_and_push_after_commit():
 
     assert 'caldav_sync_pending="create" if cal.source == "caldav" else None' in source
     assert 'ev.caldav_sync_pending = "update"' in source
-    assert 'await _push_caldav_event_after_commit(owner, uid, "create")' in source
-    assert 'await _push_caldav_event_after_commit(owner, base_uid, "update")' in source
-    assert 'await _push_caldav_event_after_commit(owner, base_uid, "delete")' in source
+    assert 'await _push_caldav_event_after_commit(owner, uid, "create", cal.id)' in source
+    assert 'await _push_caldav_event_after_commit(owner, base_uid, "update", ev.calendar_id)' in source
+    assert 'await _push_caldav_event_after_commit(owner, base_uid, "delete", ev_calendar_id)' in source
     assert "_record_caldav_delete_tombstone(db, ev, owner)" in source
     assert 'not result.get("ok")' in source
 
